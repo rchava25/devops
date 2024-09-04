@@ -1,1 +1,1 @@
-# devops practices
+# devops practices revisit
