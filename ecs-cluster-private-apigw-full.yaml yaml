@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ECS Fargate Cluster (no tasks) with internal ALB and API Gateway (HTTP API)
+  wired via a VPC Link. Exports values for a separate ECS Service stack.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC ID.
+
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for ALB and ECS tasks (multi-AZ recommended).
+
+  ApiGatewayAllowedCidr:
+    Type: String
+    Default: 10.0.0.0/8
+    Description: CIDR allowed to access the ALB from API Gateway (adjust to your environment).
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+
+  # Security group for ALB (allows ingress from API Gateway / internal callers)
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP inbound to ALB from API Gateway / VpcLink
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref ApiGatewayAllowedCidr
+
+  # Security group for ECS tasks (allows inbound from ALB SG)
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP inbound traffic from ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  # Internal Application Load Balancer
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      Scheme: internal
+      Type: application
+      Subnets: !Ref PrivateSubnets
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-tg"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # VPC Link for API Gateway v2 (HTTP API)
+  ApiGatewayVpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub "${AWS::StackName}-vpc-link"
+      SubnetIds: !Ref PrivateSubnets
+      SecurityGroupIds:
+        - !Ref ALBSecurityGroup
+
+  # HTTP API (ApiGatewayV2)
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-http-api"
+      ProtocolType: HTTP
+      # You can add CorsConfiguration here if required.
+
+  # Integration pointing to internal ALB via VPC Link
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      # IntegrationUri must be an absolute URI for the ALB. Use http://ALB_DNS.
+      IntegrationUri: !Sub "http://${ALBDNS}"
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref ApiGatewayVpcLink
+      PayloadFormatVersion: "1.0"
+
+  # Route: forward all requests to integration (catch-all)
+  CatchAllRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "ANY /{proxy+}"
+      Target: !Sub "integrations/${HttpApiIntegration}"
+
+  # Stage (auto-deploy)
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: prod
+      AutoDeploy: true
+    DependsOn:
+      - CatchAllRoute
+
+Outputs:
+  ECSClusterName:
+    Description: ECS Cluster Name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterName"
+
+  TargetGroupArn:
+    Description: ALB Target Group ARN (for ECS Service to register)
+    Value: !Ref ALBTargetGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetGroupArn"
+
+  SecurityGroupId:
+    Description: ECS tasks Security Group ID
+    Value: !Ref ECSSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroupId"
+
+  PrivateSubnetsExport:
+    Description: Private subnets (CSV) used by ALB/ECS
+    Value: !Join [ ",", !Ref PrivateSubnets ]
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnets"
+
+  ALBDNS:
+    Description: Internal ALB DNS name (useful for vpc-link testing)
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-ALBDNS"
+
+  VpcLinkId:
+    Description: API Gateway VPC Link ID
+    Value: !Ref ApiGatewayVpcLink
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcLinkId"
+
+  ApiId:
+    Description: HTTP API Id
+    Value: !Ref HttpApi
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiId"
+
+  ApiEndpoint:
+    Description: HTTP API endpoint (public URL for the API Gateway HTTP API)
+    Value: !GetAtt HttpApi.ApiEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiEndpoint"
