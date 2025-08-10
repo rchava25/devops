@@ -1,0 +1,20 @@
+aws cloudformation create-stack \
+  --stack-name ecs-cluster-private \
+  --template-body file://ecs-cluster-private-apigw-full.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters ParameterKey=VpcId,ParameterValue=vpc-0123456789abcdef \
+               ParameterKey=PrivateSubnets,ParameterValue='subnet-aaa,subnet-bbb' \
+               ParameterKey=ApiGatewayAllowedCidr,ParameterValue='10.0.0.0/8'
+
+aws cloudformation create-stack \
+  --stack-name ecs-service-private \
+  --template-body file://ecs-service-private.yaml \
+  --parameters ParameterKey=ContainerImage,ParameterValue=123456789012.dkr.ecr.us-east-1.amazonaws.com/myapp:latest \
+               ParameterKey=ClusterStackName,ParameterValue=ecs-cluster-private \
+  --capabilities CAPABILITY_NAMED_IAM
+
+aws cloudformation update-stack \
+  --stack-name ecs-service-private \
+  --template-body file://ecs-service-private.yaml \
+  --parameters ParameterKey=ContainerImage,ParameterValue=123456789012.dkr.ecr.us-east-1.amazonaws.com/myapp:newtag \
+               ParameterKey=ClusterStackName,ParameterValue=ecs-cluster-private
