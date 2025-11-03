@@ -1,0 +1,409 @@
+ubuntu
+
+sudo apt update
+wget https://releases.hashicorp.com/terraform/0.13.0/terraform_0.13.0_linux_amd64.zip
+sudo apt install unzip
+unzip terraform_0.13.0_linux_amd64.zip
+sudo mv terraform /usr/local/bin/
+terraform --version
+
+Docker Installation
+sudo apt update
+sudo apt install apt-transport-https ca-certificates curl software-properties-common
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+sudo apt update
+sudo apt install docker-ce
+sudo docker --version
+sudo usermod -aG docker $USER
+ls -l /var/run/docker.sock
+sudo chown root:docker /var/run/docker.sock
+sudo chmod 660 /var/run/docker.sock
+sudo chmod 666 /var/run/docker.sock
+sudo systemctl restart docker
+sudo docker pull nginx
+
+Application Development - Flask App and Dockerization
+
+nano app.py
+
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+@app.route('/', methods=['GET'])
+def hello_world():
+    return 'Hello, World! This is a Flask app running in Docker, created by Terraform.'
+
+@app.route('/api/data', methods=['POST'])
+def receive_data():
+    data = request.json
+    return jsonify({
+        "message": "Data received successfully",
+        "data": data
+    }), 201
+
+if __name__ == '__main__':
+app.run(host='0.0.0.0', port=5000)	
+	
+
+mkdir app
+nano requirements.txt-- flask
+nano Dockerfile
+
+
+FROM python:3.9-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+COPY app.py .
+
+CMD ["python", "app.py"]
+
+Infrastructure Deployment - Terraform Containerization
+
+main.tf
+
+terraform {
+  required_providers {
+    docker = {
+      source  = "kreuzwerker/docker"
+      version = ">= 3.0.2"
+    }
+  }
+}
+
+provider "docker" {}
+
+resource "docker_image" "flask_app" {
+  name = "flask-app:latest"
+
+  build {
+    context    = "."
+    dockerfile = "Dockerfile"
+  }
+
+  keep_locally = false
+}
+
+resource "docker_container" "flask_app" {
+  image = docker_image.flask_app.name
+  name  = "flask-container"
+
+  ports {
+    internal = 5000
+    external = 8080
+  }
+}
+
+terrafom init ,terraform validate apply
+
+docker ps
+
+sudo docker inspect -f '{{ .NetworkSettings.IPAddress }}' <ContainerId>
+
+
+Kubernetes with k3s Installation and Flask Deployment
+
+
+curl -sfL https://get.k3s.io | sh -
+
+
+sudo systemctl status k3s
+
+sudo cat /etc/rancher/k3s/k3s.yaml
+
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+sudo k3s kubectl get nodes
+ls /var/run/docker.sock
+
+ls /run/containerd/containerd.sock
+
+
+Flask App Containerization & Docker Registry Setup
+
+sudo docker build -t flask-app:latest .
+
+docker run -d -p 5000:5000 --name registry registry:2
+
+docker tag flask-app:latest localhost:5000/flask-app:latest
+
+docker push localhost:5000/flask-app:latest
+
+
+Kubernetes Deployment & Application Verification
+
+deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+      - name: flask-app-container
+        image: localhost:5000/flask-app:latest
+        ports:
+        - containerPort: 5000
+		
+sudo kubectl apply -f deployment.yaml
+
+service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app-service
+spec:
+  type: NodePort
+  selector:
+    app: my-app
+  ports:
+    - protocol: TCP
+      port: 9090
+      targetPort: 5000
+      nodePort: 31000		
+	  
+	  
+sudo kubectl apply -f service.yaml
+
+sudo k3s kubectl get pods --all-namespaces
+
+
+sudo kubectl exec -it <pod-name> -- bash
+sudo kubectl describe pod <pod-name>
+sudo kubectl logs -f <pod-name>
+sudo k3s kubectl get services
+
+
+sudo kubectl delete -f deployment.yaml
+sudo kubectl delete -f service.yaml
+
+
+
+Deploying and configuring Traefik
+This lab exercise walks through deploying and configuring Traefik in Kubernetes by creating a dedicated namespace, applying configuration files for deployment, service, config map, and ingress, verifying the setup, configuring local DNS, and testing traffic routing to a sample application.
+
+The tasks presented in this exercise include:
+
+Create a Namespace for Traefik
+Apply the Configuration Files
+Verify the Deployment
+Configure Local DNS for Testing
+Test the Setup
+
+sudo kubectl create namespace traefik
+
+traefik.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traefik
+  namespace: traefik
+  labels:
+    app: traefik
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traefik
+  template:
+    metadata:
+      labels:
+        app: traefik
+    spec:
+      containers:
+      - name: traefik
+        image: traefik:v2.6
+        args:
+        - "--configFile=/etc/traefik/traefik.yml"
+        ports:
+        - name: web
+          containerPort: 80
+        - name: websecure
+          containerPort: 443
+        volumeMounts:
+        - name: config
+          mountPath: /etc/traefik
+      volumes:
+      - name: config
+        configMap:
+          name: traefik-config
+
+traefikservice.yaml
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: traefik
+  namespace: traefik
+spec:
+  type: NodePort
+  selector:
+    app: traefik
+  ports:
+    - name: web
+      port: 80
+      targetPort: web
+      nodePort: 30080
+    - name: websecure
+      port: 443
+      targetPort: websecure
+      nodePort: 30443
+
+
+traefikconfigmap.yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traefik-config
+  namespace: traefik
+data:
+  traefik.yml: |
+    entryPoints:
+      web:
+        address: ":80"
+      websecure:
+        address: ":443"
+    providers:
+      kubernetesIngress:
+        ingressClass: "traefik"
+    log:
+      level: "DEBUG"
+    api:
+      insecure: true
+	  
+traefikingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app-ingress
+  namespace: default
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: "web,websecure"
+spec:
+  rules:
+  - host: my-app.example.com  # Replace with your domain or use a local setup
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: my-app-service
+            port:
+              number: 9090
+  tls:
+  - hosts:
+    - my-app.example.com  # Replace with your domain or use a local setup
+	
+	
+sudo kubectl apply -f traefik.yaml -n traefik
+sudo kubectl apply -f traefikservice.yaml -n traefik
+sudo kubectl apply -f traefikconfigmap.yaml -n traefik
+sudo kubectl apply -f traefikingress.yaml
+sudo kubectl get pods -n traefik
+sudo kubectl get svc -n traefik
+sudo kubectl get all -n traefik
+sudo kubectl describe ingress my-app-ingress
+
+Configure Local DNS for Testing
+
+sudo nano /etc/hosts
+127.0.0.1 my-app.example.com
+
+curl http://my-app.example.com
+curl -H "Content-Type: application/json" -X POST -d '{"key":"value"}' http://my-app.example1.com:31000/api/data
+
+for i in {1..10}; do
+  curl -H "Content-Type: application/json" -X POST -d '{"key":"value"}' \
+  http://my-app.example.com:31000/api/data
+  sleep 1s
+done
+
+
+
+Create a New Freestyle Project
+Add a build step to run JMeter
+Task 1: Create a New Freestyle Project
+Log in to the Jenkins dashboard by visiting the web address http://localhost:8080
+
+Enter the username admin and the password bdec3240805e482c9b8b34a8ad4cc517 and press Enter.
+
+Select New Item
+
+Enter a name (e.g., Terraform_Docker_Demo)
+
+Select Freestyle project and click OK or press Enter.
+
+In the job configuration page, skip the SCM section (since you're running directly on the server)
+
+Scroll down to the Build Steps section
+
+build steps.png
+
+Task 2: Add a build step to run JMeter
+Click "Add build step" → "Execute shell"
+
+In the command box, paste the following script:
+
+# Change to workspace directory and list files
+WORKSPACE="/var/lib/jenkins/workspace/Terraform_Docker_Demo"
+echo "Changing to the Jenkins workspace directory: $WORKSPACE"
+cd "$WORKSPACE"
+echo "Listing files in the workspace directory:"
+ls -la
+
+# Step 1: Initializing Terraform
+echo "Step 1: Initializing Terraform"
+terraform init
+
+# Step 2: Validate Terraform
+echo "Step 2: Validating Terraform configuration"
+terraform validate
+
+# Step3: Apply Terraform
+echo "Step 3: Applying Terraform configuration"
+terraform apply -auto-approve
+
+# Step 4: Verify Docker containers
+echo "Step 4: Verifying Docker containers"
+docker ps
+
+# Step 5: Run JMeter test
+echo "Changing to the JMeter home directory: $WORKSPACE/apache-jmeter-5.6.3/bin"
+cd "$WORKSPACE/apache-jmeter-5.6.3/bin"
+./jmeter -n -t "$WORKSPACE/Flask_App.jmx" -l "$WORKSPACE/results.jtl"
+
+# Step 6: Verify results
+echo "Returning to the initial workspace directory: $WORKSPACE"
+cd "$WORKSPACE"
+ls -la results.jtl
+
+echo "Jenkins job completed successfully."
+To save the results.jtl file as a build artifact, on the configuration page, select Add post-build action, select Archive the artifacts and enter **/results.jtl to the files to archive field.
+
+Optionally add an Email Notification post-build action to have the results sent directly to your email inbox
+
+Click Apply to save your job configuration
+
+Run the job by clicking Build Now in the project dashboard
+
+When the Jenkins job runs, this command will execute JMeter according to your test plan in the shell environment on your Jenkins server.
+
+
+	
