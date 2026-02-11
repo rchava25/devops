@@ -1,0 +1,34 @@
+Template 1: Organized Business Planning
+ROLE: [type of expert needed]
+TASK: [what to create or plan]
+CONTEXT: [business model, target customers, key operational details]
+REQUIREMENTS: [must-haves, preferences, standards to maintain]
+BUDGET CONSTRAINTS: [spending limits, timeline, financial goals]
+
+When to Use: when business information is scattered and needs clear organization
+Coffee Cart Use: organized initial business notes and expansion planning
+
+Template 2: Guided Information Gathering
+Ask questions one at a time about [topic area].
+Start with [first aspect], then move to [other aspects in sequence].
+Remember these key details: [constraints and context].
+After collecting answers, create [deliverable].
+
+When to Use: when building comprehensive plans through systematic questioning
+Coffee Cart Use: gathered complete setup details for launch planning
+
+
+*************************************************************************************
+
+Category: Few-Shot Prompting
+When to Use: Need consistent formatting across multiple communications
+Template: "Here are examples of our [type] format:
+
+Example 1: '[specific example with desired format]'
+Example 2: '[another example following same format]'
+
+Now create [new content] using this same format."
+
+What worked: Used for artist invitations with professional format examples
+Planning application: Artist invitations, sponsor communications, and vendor outreach
+Key benefit: Ensures professional consistency without starting from scratch each time
