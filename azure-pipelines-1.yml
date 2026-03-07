@@ -6,8 +6,8 @@
 trigger:
 - main
 
-pool:
-  vmImage: ubuntu-latest
+pool: mycustompool
+
 
 steps:
 - script: echo Hello, world!
