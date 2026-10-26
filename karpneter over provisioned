@@ -1,0 +1,240 @@
+how to resize pods based on usage because karpneter over provisioned
+Amazon Q
+Check cluster addons, alarms, and compute config for VPA/HPA/Karpenter context
+Listing Kubernetes Resources
+Listing Kubernetes Resources
+Your cluster has no HPA or VPA configured — and your inflate deployment is the classic Karpenter over-provisioning pattern (a pause container with inflated resource requests to pre-warm nodes). Here is the complete guide:
+
+Right-sizing Pods with Karpenter Over-provisioning
+Why Karpenter over-provisions — and what it means
+Your inflate deployment uses the over-provisioning pattern: it runs pause containers with large resource requests to hold capacity on nodes. When a real workload arrives, it evicts the pause pods and the node is already warm — no cold-start delay.
+
+The problem is the requests are guesses. If they are too large, Karpenter provisions bigger/more nodes than needed. The fix is a two-part approach:
+
+1. VPA  → right-size individual pod CPU/memory requests automatically
+2. HPA  → scale pod count horizontally based on actual usage
+3. Karpenter Disruption Budget → control how aggressively Karpenter consolidates
+
+Part 1 — Vertical Pod Autoscaler (VPA)
+VPA watches actual CPU/memory usage and automatically adjusts pod requests to match real consumption. This directly fixes Karpenter over-provisioning because Karpenter sizes nodes based on pod requests.
+
+Install VPA
+# Clone the VPA repo
+git clone https://github.com/kubernetes/autoscaler.git
+cd autoscaler/vertical-pod-autoscaler
+
+# Install VPA components (recommender, updater, admission controller)
+./hack/vpa-up.sh
+
+# Verify all 3 VPA components are running
+kubectl get pods -n kube-system | grep vpa
+# Expected:
+# vpa-admission-controller-xxx   Running
+# vpa-recommender-xxx            Running
+# vpa-updater-xxx                Running
+
+Run in CloudShell
+Apply VPA to your inflate deployment
+# vpa-inflate.yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: inflate-vpa
+  namespace: default
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: inflate
+  updatePolicy:
+    updateMode: "Auto"       # Auto = VPA restarts pods with new requests
+                             # "Off" = recommendation only, no changes
+                             # "Initial" = only on new pods, no restarts
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 50m
+        memory: 64Mi
+      maxAllowed:
+        cpu: 4
+        memory: 8Gi
+      controlledResources: ["cpu", "memory"]
+
+kubectl apply -f vpa-inflate.yaml
+
+# Check VPA recommendations after ~10 minutes of traffic
+kubectl describe vpa inflate-vpa -n default
+# Look for:
+#   Lower Bound:   cpu: 25m    memory: 262144k
+#   Target:        cpu: 100m   memory: 512Mi    ← VPA will set requests to this
+#   Upper Bound:   cpu: 500m   memory: 2Gi
+
+Run in CloudShell
+⚠️ Do not run VPA Auto mode together with HPA on the same metric (CPU/memory). They conflict. Use VPA for requests sizing + HPA on custom metrics (RPS, queue depth), or use VPA in Off mode to get recommendations and apply them manually.
+
+Part 2 — Horizontal Pod Autoscaler (HPA)
+HPA scales the number of pod replicas based on CPU, memory, or custom metrics. This works alongside Karpenter — more pods → Karpenter adds nodes; fewer pods → Karpenter consolidates nodes.
+
+Prerequisite — install metrics-server
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# Verify
+kubectl top nodes
+kubectl top pods -A
+
+Run in CloudShell
+Apply HPA to inflate deployment
+# hpa-inflate.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: inflate-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: inflate
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60    # scale up when avg CPU > 60%
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 70    # scale up when avg memory > 70%
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60     # wait 60s before scaling up
+      policies:
+      - type: Pods
+        value: 2
+        periodSeconds: 60               # add max 2 pods per minute
+    scaleDown:
+      stabilizationWindowSeconds: 300   # wait 5 min before scaling down
+      policies:
+      - type: Percent
+        value: 25
+        periodSeconds: 120              # remove max 25% of pods per 2 min
+
+kubectl apply -f hpa-inflate.yaml
+
+# Watch HPA in action
+kubectl get hpa -n default -w
+# NAME           REFERENCE             TARGETS         MINPODS   MAXPODS   REPLICAS
+# inflate-hpa    Deployment/inflate    12%/60%         2         20        2
+
+Run in CloudShell
+Part 3 — Fix Karpenter over-provisioning directly
+The inflate deployment itself is the over-provisioning mechanism. Right-size its requests so Karpenter doesn't hold excess capacity:
+
+Check current inflate requests
+kubectl get deployment inflate -n default -o jsonpath='{.spec.template.spec.containers[*].resources}'
+
+Run in CloudShell
+Tune the inflate deployment requests
+# Right-sized inflate deployment — match to your actual workload headroom need
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inflate
+  namespace: default
+spec:
+  replicas: 1                    # reduce replicas — 1 is usually enough for warm capacity
+  template:
+    spec:
+      priorityClassName: low-priority   # CRITICAL — real pods evict inflate pods
+      containers:
+      - name: pause
+        image: public.ecr.aws/eks-distro/kubernetes/pause:3.7
+        resources:
+          requests:
+            cpu: "1"             # tune this to match ONE real pod's expected size
+            memory: "1Gi"        # tune this to match ONE real pod's expected size
+
+Create a low priority class for inflate pods
+# priority-class.yaml — inflate pods are evicted first when real workloads arrive
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: low-priority
+value: -1                        # negative = below default (0)
+globalDefault: false
+description: "Used by inflate over-provisioning pods — evicted first"
+
+kubectl apply -f priority-class.yaml
+
+Run in CloudShell
+Part 4 — Karpenter consolidation (Auto Mode)
+Since your cluster uses EKS Auto Mode (Karpenter-based), configure disruption settings to consolidate over-provisioned nodes automatically:
+
+# nodepool-consolidation.yaml — tune the general-purpose node pool
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: general-purpose
+spec:
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized   # consolidate underutilized nodes
+    consolidateAfter: 30s                            # wait 30s after pod eviction
+    budgets:
+    - nodes: "20%"                                   # never disrupt more than 20% of nodes at once
+  template:
+    spec:
+      expireAfter: 720h                              # recycle nodes every 30 days
+
+kubectl apply -f nodepool-consolidation.yaml
+
+# Watch Karpenter consolidation decisions
+kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter -f | grep -i consolidat
+
+Run in CloudShell
+Decision guide — which tool to use
+Is your pod using too much CPU/memory per replica?
+  └─ YES → Use VPA (right-size requests)
+           kubectl describe vpa <name> to see recommendations
+
+Are you getting too many/few pod replicas under load?
+  └─ YES → Use HPA (scale replicas based on utilization)
+           kubectl get hpa -A to check current state
+
+Are nodes too large for the workloads on them?
+  └─ YES → Tune inflate deployment requests downward
+           + enable Karpenter consolidation policy
+
+Are nodes staying alive with very low utilization?
+  └─ YES → Set consolidationPolicy: WhenEmptyOrUnderutilized on NodePool
+           + reduce consolidateAfter to 30s
+
+Quick commands to check right now
+# See actual CPU/memory usage per pod
+kubectl top pods -A
+
+# See actual CPU/memory usage per node
+kubectl top nodes
+
+# See what VPA recommends (after installing VPA)
+kubectl describe vpa -A
+
+# See HPA current targets vs actual
+kubectl get hpa -A
+
+# See Karpenter NodeClaims and their utilization
+kubectl get nodeclaims
+
+# See Karpenter disruption log
+kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter | grep -E "consolidat|disrupt|terminat"
+
+Run in CloudShell
+For your inflate deployment specifically — the immediate fix is to set a low-priority PriorityClass on it and reduce its requests to match the size of one real workload pod. That alone will cause Karpenter to provision correctly-sized nodes instead of over-sized ones, and real pods will evict the inflate pods on demand.
+
+
+
