@@ -1,0 +1,215 @@
+Auto Mode → Managed Node Groups Migration
+Your current state
+Property	Value
+Cluster	eks (v1.37, us-east-1)
+Auto Mode	✅ Enabled — general-purpose + system node pools
+Built-in storage	✅ Block storage enabled
+Built-in load balancing	✅ Elastic load balancing enabled
+Subnets	subnet-03da6ad4ced808a19, subnet-001af177100973cfd
+Node groups	None (pure Auto Mode today)
+Addons	coredns, eks-node-monitoring-agent, eks-pod-identity-agent, kube-proxy
+⚠️ Only 2 subnets detected (both in us-east-1). For production node groups you need 3 subnets across 3 AZs. You should add a third subnet before creating node groups.
+
+Migration strategy — zero downtime
+The safest approach is run both in parallel, migrate workloads, then disable Auto Mode. Never disable Auto Mode before node groups are ready and workloads are running.
+
+Phase 1: Prepare IAM
+Phase 2: Create node groups (alongside Auto Mode)
+Phase 3: Install required addons
+Phase 4: Migrate workloads to node groups
+Phase 5: Disable Auto Mode
+Phase 6: Verify
+
+Phase 1 — Create the node IAM role
+Auto Mode uses AmazonEKSAutoNodeRole. Node groups need a separate AmazonEKSNodeRole with different policies:
+
+# Step 1 — Create the trust policy document
+cat > node-trust-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "ec2.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+EOF
+
+# Step 2 — Create the role
+aws iam create-role \
+  --role-name AmazonEKSNodeRole \
+  --assume-role-policy-document file://node-trust-policy.json
+
+# Step 3 — Attach all 4 required policies
+aws iam attach-role-policy --role-name AmazonEKSNodeRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+
+aws iam attach-role-policy --role-name AmazonEKSNodeRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+
+aws iam attach-role-policy --role-name AmazonEKSNodeRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+aws iam attach-role-policy --role-name AmazonEKSNodeRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+# Step 4 — Verify
+aws iam list-attached-role-policies --role-name AmazonEKSNodeRole
+
+Run in CloudShell
+Phase 2 — Create managed node groups
+Your cluster has 2 subnets. Create one node group per subnet now, and add a third AZ subnet when available:
+
+# Node group for subnet-03da6ad4ced808a19
+aws eks create-nodegroup \
+  --cluster-name eks \
+  --nodegroup-name prod-ng-1 \
+  --node-role arn:aws:iam::827841612288:role/AmazonEKSNodeRole \
+  --subnets subnet-03da6ad4ced808a19 subnet-001af177100973cfd \
+  --instance-types m5.xlarge m5a.xlarge \
+  --ami-type AL2_x86_64 \
+  --capacity-type ON_DEMAND \
+  --scaling-config minSize=2,maxSize=10,desiredSize=3 \
+  --update-config maxUnavailablePercentage=33 \
+  --labels role=general-purpose \
+  --region us-east-1
+
+# Watch node group creation (takes ~3-5 minutes)
+aws eks describe-nodegroup \
+  --cluster-name eks \
+  --nodegroup-name prod-ng-1 \
+  --query 'nodegroup.status' \
+  --region us-east-1
+
+Run in CloudShell
+Wait for status ACTIVE before proceeding.
+
+# Verify nodes joined the cluster
+kubectl get nodes -L eks.amazonaws.com/nodegroup,topology.kubernetes.io/zone
+
+Run in CloudShell
+Phase 3 — Install addons required by node groups
+Your cluster already has coredns and kube-proxy. You need to add vpc-cni and aws-ebs-csi-driver — these were handled by Auto Mode before:
+
+# Install vpc-cni (REQUIRED — this is the CNI for node groups)
+aws eks create-addon \
+  --cluster-name eks \
+  --addon-name vpc-cni \
+  --resolve-conflicts OVERWRITE \
+  --region us-east-1
+
+# Install aws-ebs-csi-driver (REQUIRED for PersistentVolumes)
+# First create the IRSA role for it
+eksctl create iamserviceaccount \
+  --cluster eks \
+  --namespace kube-system \
+  --name ebs-csi-controller-sa \
+  --attach-policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+  --approve \
+  --region us-east-1
+
+# Then install the addon
+aws eks create-addon \
+  --cluster-name eks \
+  --addon-name aws-ebs-csi-driver \
+  --resolve-conflicts OVERWRITE \
+  --region us-east-1
+
+# Verify both addons are ACTIVE
+aws eks list-addons --cluster-name eks --region us-east-1
+aws eks describe-addon --cluster-name eks --addon-name vpc-cni \
+  --query 'addon.status' --region us-east-1
+aws eks describe-addon --cluster-name eks --addon-name aws-ebs-csi-driver \
+  --query 'addon.status' --region us-east-1
+
+Run in CloudShell
+Phase 4 — Migrate workloads to node groups
+At this point both Auto Mode nodes and node group nodes are running. Drain Auto Mode nodes gracefully to move workloads:
+
+# Step 1 — Identify Auto Mode nodes (managed by Karpenter/NodeClaims)
+kubectl get nodes -l eks.amazonaws.com/compute-type=auto
+
+# Step 2 — Cordon Auto Mode nodes (stop new pods scheduling on them)
+for node in $(kubectl get nodes -l eks.amazonaws.com/compute-type=auto -o name); do
+  kubectl cordon $node
+done
+
+# Step 3 — Verify workloads are scheduling on node group nodes
+kubectl get pods -A -o wide | grep -v "eks.amazonaws.com/compute-type=auto"
+
+# Step 4 — Drain Auto Mode nodes one at a time
+for node in $(kubectl get nodes -l eks.amazonaws.com/compute-type=auto -o jsonpath='{.items[*].metadata.name}'); do
+  kubectl drain $node \
+    --ignore-daemonsets \
+    --delete-emptydir-data \
+    --grace-period=60 \
+    --timeout=300s
+  echo "Drained $node — waiting 30s before next node"
+  sleep 30
+done
+
+# Step 5 — Confirm all pods are Running on node group nodes
+kubectl get pods -A -o wide
+kubectl get nodes
+
+Run in CloudShell
+Phase 5 — Disable Auto Mode
+Only do this after all pods are Running on node group nodes:
+
+# Disable Auto Mode compute and storage
+aws eks update-cluster-config \
+  --name eks \
+  --compute-config '{"enabled": false}' \
+  --kubernetes-network-config '{"elasticLoadBalancing": {"enabled": false}}' \
+  --storage-config '{"blockStorage": {"enabled": false}}' \
+  --region us-east-1
+
+# Watch the update
+aws eks describe-cluster --name eks \
+  --query 'cluster.status' --region us-east-1
+
+# Verify Auto Mode node pools are gone
+kubectl get nodeclaims 2>/dev/null || echo "NodeClaims API gone — Auto Mode fully disabled"
+
+Run in CloudShell
+⚠️ After disabling Auto Mode's built-in load balancing, install the AWS Load Balancer Controller via Helm if you use Ingress or LoadBalancer services — otherwise your services will lose their ALB/NLB.
+
+# Install AWS Load Balancer Controller (replaces Auto Mode's built-in ELB)
+helm repo add eks https://aws.github.io/eks-charts
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  --namespace kube-system \
+  --set clusterName=eks \
+  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<IRSA-role-arn>
+
+Run in CloudShell
+Phase 6 — Post-migration verification
+# 1. All nodes Ready and on node groups
+kubectl get nodes -L eks.amazonaws.com/nodegroup,topology.kubernetes.io/zone
+
+# 2. All pods Running
+kubectl get pods -A | grep -v Running | grep -v Completed
+
+# 3. No Auto Mode node pools remain
+kubectl get nodepools 2>/dev/null
+
+# 4. vpc-cni is healthy on all nodes
+kubectl get pods -n kube-system -l k8s-app=aws-node
+
+# 5. Node role has all required policies
+aws iam list-attached-role-policies --role-name AmazonEKSNodeRole
+
+# 6. Access entry for node role exists
+aws eks list-access-entries --cluster-name eks --region us-east-1
+
+Run in CloudShell
+Key differences to remember after migration
+Capability	Auto Mode	Managed Node Groups
+Pod IP assignment	EKS IPAM controller	vpc-cni daemonset (aws-node)
+IP permission lives on	AmazonEKSClusterRole	AmazonEKSNodeRole
+CNI policy needed	AmazonEKSNetworkingPolicy	AmazonEKS_CNI_Policy
+Node scaling	Karpenter (automatic)	Cluster Autoscaler (manual setup)
+EBS volumes	Built-in	aws-ebs-csi-driver addon
+Load balancing	Built-in	AWS Load Balancer Controller
+Node upgrades	Automatic	Manual (aws eks update-nodegroup-version)
+
+
