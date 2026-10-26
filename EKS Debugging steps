@@ -1,0 +1,316 @@
+must have debugging sequence steps or commands
+Amazon Q
+Check EKS health events, CloudWatch alarms, and EKS notifications
+Get full EKS cluster state for debugging context
+No open health events, no firing alarms. Your cluster eks (v1.37, Auto Mode, us-east-1) is clean. Here is the complete EKS debugging sequence — structured from first symptom to root cause, covering every layer of the stack:
+
+EKS Must-Have Debugging Command Sequence
+The golden rule — always debug in this order
+1. Cluster health      →  is the control plane OK?
+2. Node health         →  are nodes Ready?
+3. Pod health          →  are pods Running?
+4. Application health  →  is the app responding?
+5. Network health      →  can pods talk to each other?
+6. IAM / RBAC          →  are permissions correct?
+
+Never skip layers. A pod issue is often a node issue in disguise. A node issue is often an IAM issue in disguise.
+
+Level 0 — Cluster health
+# Is the control plane healthy?
+aws eks describe-cluster --name eks --region us-east-1 \
+  --query 'cluster.{Status:status,Version:version,Endpoint:endpoint,Logging:logging}'
+
+# Are all addons healthy?
+aws eks list-addons --cluster-name eks --region us-east-1
+aws eks describe-addon --cluster-name eks --addon-name coredns \
+  --query 'addon.{Status:status,Issues:health.issues}'
+
+# Any open AWS health events for EKS?
+aws health describe-events \
+  --filter services=EKS,regions=us-east-1,eventStatusCodes=open \
+  --region us-east-1
+
+# Check control plane logs in CloudWatch
+aws logs describe-log-groups \
+  --log-group-name-prefix /aws/eks/eks/cluster \
+  --region us-east-1
+
+Run in CloudShell
+Level 1 — Node debugging
+# ── STEP 1: Are nodes Ready? ──────────────────────────────────────────────────
+kubectl get nodes -o wide
+# Look for: STATUS=Ready, correct VERSION, correct ROLES
+
+# ── STEP 2: Why is a node NotReady? ──────────────────────────────────────────
+kubectl describe node <node-name>
+# Look for in Events section:
+#   NodeNotReady        → kubelet stopped posting status
+#   DiskPressure        → node disk > 85% full
+#   MemoryPressure      → node memory exhausted
+#   PIDPressure         → too many processes
+#   NetworkUnavailable  → CNI not initialized (vpc-cni issue)
+
+# ── STEP 3: Node conditions at a glance ──────────────────────────────────────
+kubectl get nodes -o json | jq '.items[] | {
+  name: .metadata.name,
+  conditions: [.status.conditions[] | select(.status=="True") | .type]
+}'
+
+# ── STEP 4: What is allocated vs available on each node? ─────────────────────
+kubectl describe nodes | grep -A 8 "Allocated resources"
+
+# ── STEP 5: Karpenter NodeClaims (Auto Mode) ─────────────────────────────────
+kubectl get nodeclaims
+kubectl describe nodeclaim <nodeclaim-name>
+# Look for: Status.Conditions — why was this node provisioned/deprovisioned
+
+# ── STEP 6: Karpenter logs — provisioning decisions ──────────────────────────
+kubectl logs -n kube-system \
+  -l app.kubernetes.io/name=karpenter \
+  --since=10m | grep -E "ERROR|WARN|provisioned|disrupted|failed|nodeclaim"
+
+# ── STEP 7: Node resource usage ──────────────────────────────────────────────
+kubectl top nodes
+# If this fails: metrics-server is not installed
+
+Run in CloudShell
+Level 2 — Pod debugging (most common layer)
+# ── STEP 1: Find all non-Running pods ────────────────────────────────────────
+kubectl get pods -A | grep -v -E "Running|Completed"
+# States to investigate:
+#   Pending           → scheduler cannot place pod (no node, taints, affinity)
+#   ContainerCreating → image pull or CNI issue
+#   CrashLoopBackOff  → app is crashing on startup
+#   OOMKilled         → memory limit too low
+#   Evicted           → node ran out of resources
+#   ImagePullBackOff  → cannot pull image (ECR auth, wrong tag)
+#   Terminating       → stuck finalizer or node gone
+
+# ── STEP 2: Why is a pod Pending? ────────────────────────────────────────────
+kubectl describe pod <pod-name> -n <namespace>
+# Look for in Events section:
+#   0/1 nodes available: insufficient cpu     → requests too high
+#   0/1 nodes available: node(s) had taint    → taint/toleration mismatch
+#   0/1 nodes available: didn't match affinity → nodeSelector/affinity wrong
+#   no nodes available                         → Karpenter not provisioning
+
+# ── STEP 3: Why is a pod CrashLoopBackOff? ───────────────────────────────────
+# Current logs
+kubectl logs <pod-name> -n <namespace>
+
+# Previous crashed container logs (most useful for CrashLoopBackOff)
+kubectl logs <pod-name> -n <namespace> --previous
+
+# Tail live logs
+kubectl logs <pod-name> -n <namespace> -f --tail=100
+
+# Multi-container pod — specify container
+kubectl logs <pod-name> -n <namespace> -c <container-name>
+
+# ── STEP 4: Why is a pod OOMKilled? ──────────────────────────────────────────
+kubectl describe pod <pod-name> -n <namespace> | grep -A 5 "Last State"
+# Look for:
+#   Reason: OOMKilled   → increase memory limit
+#   Exit Code: 137      → OOMKilled confirmation
+
+# ── STEP 5: Pod resource usage ───────────────────────────────────────────────
+kubectl top pods -A --containers
+# Shows per-container CPU and memory usage
+# Compare against requests/limits in the deployment
+
+# ── STEP 6: Pod resource requests vs limits ───────────────────────────────────
+kubectl get pods -A -o json | jq -r '
+  .items[] |
+  .metadata.namespace + "/" + .metadata.name + " → " +
+  (.spec.containers[].resources | tostring)'
+
+# ── STEP 7: Pods with NO resource requests (dangerous) ───────────────────────
+kubectl get pods -A -o json | jq -r '
+  .items[] |
+  select(.spec.containers[].resources.requests == null) |
+  .metadata.namespace + "/" + .metadata.name + " has NO requests"'
+
+# ── STEP 8: Shell into a running pod ─────────────────────────────────────────
+kubectl exec -it <pod-name> -n <namespace> -- /bin/sh
+# If /bin/sh not available:
+kubectl exec -it <pod-name> -n <namespace> -- /bin/bash
+
+# ── STEP 9: Run a debug container on a node ──────────────────────────────────
+kubectl debug node/<node-name> -it --image=public.ecr.aws/amazonlinux/amazonlinux:2
+
+Run in CloudShell
+Level 3 — Deployment / ReplicaSet debugging
+# ── STEP 1: Deployment rollout status ────────────────────────────────────────
+kubectl rollout status deployment/<name> -n <namespace>
+# Stuck here = pods not becoming Ready
+
+# ── STEP 2: Deployment history ───────────────────────────────────────────────
+kubectl rollout history deployment/<name> -n <namespace>
+
+# ── STEP 3: Rollback to previous version ─────────────────────────────────────
+kubectl rollout undo deployment/<name> -n <namespace>
+
+# ── STEP 4: ReplicaSet — why aren't replicas coming up? ──────────────────────
+kubectl get replicaset -n <namespace>
+kubectl describe replicaset <rs-name> -n <namespace>
+# Look for: FailedCreate events — quota exceeded, image pull errors
+
+# ── STEP 5: Events for a deployment ──────────────────────────────────────────
+kubectl get events -n <namespace> \
+  --field-selector involvedObject.name=<deployment-name> \
+  --sort-by='.lastTimestamp'
+
+# ── STEP 6: All recent warning events cluster-wide ───────────────────────────
+kubectl get events -A \
+  --field-selector type=Warning \
+  --sort-by='.lastTimestamp' | tail -30
+
+Run in CloudShell
+Level 4 — Network debugging
+# ── STEP 1: Is CoreDNS healthy? ──────────────────────────────────────────────
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=50
+
+# ── STEP 2: DNS resolution test from inside a pod ────────────────────────────
+kubectl run dns-test --image=busybox:1.28 --restart=Never -it --rm \
+  -- nslookup kubernetes.default
+# Expected: Server: 172.20.0.10  Address: kubernetes.default.svc.cluster.local
+
+# ── STEP 3: Can pod A reach pod B? ───────────────────────────────────────────
+# Get pod B's IP
+kubectl get pod <pod-b> -n <namespace> -o jsonpath='{.status.podIP}'
+
+# Shell into pod A and curl pod B
+kubectl exec -it <pod-a> -n <namespace> -- curl http://<pod-b-ip>:<port>
+
+# ── STEP 4: Is a Service routing correctly? ──────────────────────────────────
+kubectl get svc -n <namespace>
+kubectl describe svc <service-name> -n <namespace>
+# Look for: Endpoints — if empty, label selector doesn't match any pods
+
+kubectl get endpoints <service-name> -n <namespace>
+# Empty endpoints = selector mismatch or no Ready pods
+
+# ── STEP 5: Is vpc-cni healthy? (node groups) ────────────────────────────────
+kubectl get pods -n kube-system -l k8s-app=aws-node
+kubectl logs -n kube-system -l k8s-app=aws-node --tail=50 | grep -E "ERROR|WARN|failed"
+
+# ── STEP 6: Network policy blocking traffic? ─────────────────────────────────
+kubectl get networkpolicy -A
+kubectl describe networkpolicy <name> -n <namespace>
+
+# ── STEP 7: Test connectivity with a temporary pod ───────────────────────────
+kubectl run nettest --image=nicolaka/netshoot --restart=Never -it --rm \
+  -- curl -v http://<service-name>.<namespace>.svc.cluster.local:<port>
+
+Run in CloudShell
+Level 5 — IAM / RBAC debugging
+# ── STEP 1: Can I perform an action? (dry-run auth check) ────────────────────
+kubectl auth can-i get pods -n default
+kubectl auth can-i get pods -n default --as system:serviceaccount:default:my-sa
+
+# ── STEP 2: What can a service account do? ───────────────────────────────────
+kubectl auth can-i --list --as system:serviceaccount:<namespace>:<sa-name>
+
+# ── STEP 3: Who has access to what? ──────────────────────────────────────────
+kubectl get rolebindings,clusterrolebindings -A \
+  -o json | jq -r '
+  .items[] |
+  .metadata.name + " → " +
+  (.subjects // [] | map(.name) | join(", "))'
+
+# ── STEP 4: EKS access entries ───────────────────────────────────────────────
+aws eks list-access-entries --cluster-name eks --region us-east-1
+aws eks describe-access-entry \
+  --cluster-name eks \
+  --principal-arn <role-arn> \
+  --region us-east-1
+
+# ── STEP 5: IRSA — is the service account annotated? ─────────────────────────
+kubectl get serviceaccount <sa-name> -n <namespace> -o yaml
+# Look for: eks.amazonaws.com/role-arn annotation
+
+# ── STEP 6: Check IAM policies on node role ───────────────────────────────────
+aws iam list-attached-role-policies \
+  --role-name AmazonEKSAutoNodeRole \
+  --region us-east-1
+
+Run in CloudShell
+Level 6 — Storage debugging
+# ── STEP 1: PVC not binding? ─────────────────────────────────────────────────
+kubectl get pvc -A
+# STATUS=Pending → StorageClass issue or no available PV
+
+kubectl describe pvc <pvc-name> -n <namespace>
+# Look for: ProvisioningFailed, no persistent volumes available
+
+# ── STEP 2: StorageClass configured? ─────────────────────────────────────────
+kubectl get storageclass
+# For Auto Mode: should see gp2 or gp3 as default
+
+# ── STEP 3: EBS CSI driver healthy? ──────────────────────────────────────────
+kubectl get pods -n kube-system -l app=ebs-csi-controller
+kubectl logs -n kube-system -l app=ebs-csi-controller -c ebs-plugin --tail=50
+
+# ── STEP 4: Volume attachment events ─────────────────────────────────────────
+kubectl get events -A \
+  --field-selector reason=FailedAttachVolume \
+  --sort-by='.lastTimestamp'
+
+Run in CloudShell
+Level 7 — inflate-specific debugging (your cluster)
+# ── STEP 1: Check inflate has no resource requests (confirmed issue) ──────────
+kubectl get deployment inflate -n default \
+  -o jsonpath='{.spec.template.spec.containers[0].resources}'
+# Current output: {}  ← fix this first
+
+# ── STEP 2: Check inflate has no PriorityClass (confirmed issue) ──────────────
+kubectl get deployment inflate -n default \
+  -o jsonpath='{.spec.template.spec.priorityClassName}'
+# Current output: (empty)  ← fix this second
+
+# ── STEP 3: Apply the fix ─────────────────────────────────────────────────────
+# Create low-priority class
+kubectl apply -f - <<EOF
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: low-priority
+value: -1
+globalDefault: false
+description: "inflate over-provisioning pods — evicted first"
+EOF
+
+# Patch inflate with correct requests + priority
+kubectl patch deployment inflate -n default --type=merge -p '{
+  "spec": {"template": {"spec": {
+    "priorityClassName": "low-priority",
+    "containers": [{"name": "pause", "resources": {
+      "requests": {"cpu": "1", "memory": "1Gi"}
+    }}]
+  }}}
+}'
+
+# ── STEP 4: Verify Karpenter reacts ──────────────────────────────────────────
+kubectl rollout status deployment/inflate -n default
+kubectl get nodeclaims -w
+kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter \
+  --since=2m | grep -E "provisioned|consolidat|inflate"
+
+Run in CloudShell
+One-liner full cluster snapshot — run this first every time
+echo "━━━ CLUSTER ━━━" && \
+aws eks describe-cluster --name eks --region us-east-1 \
+  --query 'cluster.{Status:status,Version:version}' && \
+echo "━━━ NODES ━━━" && kubectl get nodes -o wide && \
+echo "━━━ PODS (non-Running) ━━━" && \
+kubectl get pods -A | grep -v -E "Running|Completed|NAME" && \
+echo "━━━ NODECLAIMS ━━━" && kubectl get nodeclaims && \
+echo "━━━ EVENTS (Warnings) ━━━" && \
+kubectl get events -A --field-selector type=Warning \
+  --sort-by='.lastTimestamp' | tail -20 && \
+echo "━━━ TOP NODES ━━━" && kubectl top nodes 2>/dev/null && \
+echo "━━━ TOP PODS ━━━" && kubectl top pods -A 2>/dev/null
+
+Run in CloudShell
+Save this as eks-snapshot.sh and run it as the very first command whenever something is wrong. It tells you which layer to investigate in under 10 seconds.
