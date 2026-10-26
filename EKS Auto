@@ -1,0 +1,187 @@
+EKS Auto Mode — Pod Pending: Root Cause Analysis & Runbook
+Incident Summary
+Cluster: eks (us-east-1) Impact: All pods stuck in Pending / ContainerCreating for ~2.5 hours Resolution: Attached AmazonEKSNetworkingPolicy to AmazonEKSClusterRole
+
+Root Causes (in order of discovery)
+#	Component	Finding	Impact	Severity
+1	AmazonEKSClusterRole	AmazonEKSNetworkingPolicy not attached	IPAM controller denied ec2:AssignPrivateIpAddresses — no IPs assigned to pods on any node	Critical
+2	EKS Access Entries	Stale AmazonEKSAutoNodeRole1 access entry (wrong type, not EC2_LINUX)	New Auto Mode nodes failed to register with cluster — immediately deprovisioned as Empty	High
+3	EKS Addons	vpc-cni addon installed on an Auto Mode cluster	Stale aws-cni binary on nodes conflicted with Auto Mode native CNI — FailedCreatePodSandBox on every pod	High
+Error Chain
+How the three misconfigurations compounded each other into a 2.5-hour outage:
+
+AmazonEKSNetworkingPolicy missing → IPAM controller denied ec2:AssignPrivateIpAddresses → no pod IPs assigned → all pods Pending
+Stale AmazonEKSAutoNodeRole1 access entry → new nodes launched by Auto Mode failed to register → nodes immediately deprovisioned as Empty
+vpc-cni addon installed alongside Auto Mode → stale aws-cni binary on nodes conflicted with Auto Mode's native CNI → FailedCreatePodSandBox errors even after nodes registered
+The true root cause was #1. Issues #2 and #3 were pre-existing misconfigurations that surfaced during remediation attempts.
+
+Symptoms & Diagnosis
+Observable Symptoms
+Symptom	Where to see it	Points to
+All pods stuck in Pending / ContainerCreating indefinitely	kubectl get pods -A	IPAM cannot assign IPs (root cause)
+FailedCreatePodSandBox: aws-cni failed to assign IP address to container	kubectl describe pod <name>	vpc-cni addon conflict OR missing AmazonEKSNetworkingPolicy
+ipam-controller: AssignPrivateIpAddresses 403 UnauthorizedOperation	EKS cluster logs / CloudTrail	AmazonEKSNetworkingPolicy missing from AmazonEKSClusterRole
+Nodes launch then immediately deprovisioned as Empty	EKS Compute console / CloudTrail RunInstances + TerminateInstances	Stale access entry blocking node registration
+AccessEntry for NodeRoleArn should either not exist or have type EC2	EKS console → Cluster → Access tab	Stale AmazonEKSAutoNodeRole1 access entry
+nodes <instance-id> not found in console	EKS Resources console	Node was deprovisioned — stale console reference, not an error
+Diagnostic Commands — Run in Order
+# Step 1 — Check pod status
+kubectl get pods -A
+# Look for: any pods in Pending or ContainerCreating for more than 2 minutes
+
+# Step 2 — Describe a stuck pod
+kubectl describe pod <pod-name> -n <namespace>
+# Look for: FailedCreatePodSandBox or FailedScheduling in the Events section
+
+# Step 3 — Check IAM policies on the cluster role
+aws iam list-attached-role-policies --role-name AmazonEKSClusterRole
+# Look for: AmazonEKSClusterPolicy, AmazonEKSComputePolicy,
+#           AmazonEKSNetworkingPolicy, AmazonEKSBlockStoragePolicy
+
+# Step 4 — Check for stale access entries
+aws eks list-access-entries --cluster-name <cluster>
+# Look for: any entry containing AmazonEKSAutoNodeRole1 (trailing 1) — should not exist
+
+# Step 5 — Check installed addons
+aws eks list-addons --cluster-name <cluster>
+# Look for: vpc-cni should NOT be present on Auto Mode clusters
+
+# Step 6 — Check IPAM errors in CloudTrail
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=EventName,AttributeValue=AssignPrivateIpAddresses \
+  --max-results 5
+# Look for: 403 UnauthorizedOperation errors from eks-auto-mode-ipam-* principal
+
+Run in CloudShell
+Fix Steps
+Fix 1 — Attach AmazonEKSNetworkingPolicy (Root Cause)
+Required for: EKS Auto Mode clusters. The IPAM controller runs as AmazonEKSClusterRole and needs ec2:AssignPrivateIpAddresses to assign pod IPs.
+
+# Step 1 — Attach AmazonEKSNetworkingPolicy
+aws iam attach-role-policy \
+  --role-name AmazonEKSClusterRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEKSNetworkingPolicy
+
+# Step 2 — Attach AmazonEKSBlockStoragePolicy (also required)
+aws iam attach-role-policy \
+  --role-name AmazonEKSClusterRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEKSBlockStoragePolicy
+
+# Step 3 — Verify all 4 policies are attached
+aws iam list-attached-role-policies --role-name AmazonEKSClusterRole
+
+# Step 4 — Wait 60–90 seconds for IPAM controller session to refresh
+# (IAM credential propagation delay — this is expected, do not re-apply the fix)
+
+# Step 5 — Confirm IPAM is now succeeding (look for events with no errorCode)
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=EventName,AttributeValue=AssignPrivateIpAddresses \
+  --max-results 5
+
+Run in CloudShell
+Fix 2 — Remove Stale Access Entry
+Required for: Any cluster where AmazonEKSAutoNodeRole1 (note the trailing 1) appears as an access entry. This stale entry blocks new Auto Mode nodes from registering.
+
+# Step 1 — List all access entries to find the stale one
+aws eks list-access-entries --cluster-name <cluster>
+
+# Step 2 — Delete the stale AmazonEKSAutoNodeRole1 entry
+aws eks delete-access-entry \
+  --cluster-name <cluster> \
+  --principal-arn arn:aws:iam::<account-id>:role/AmazonEKSAutoNodeRole1
+
+# Step 3 — Verify only valid entries remain
+# (should have AmazonEKSAutoNodeRole without the trailing 1)
+aws eks list-access-entries --cluster-name <cluster>
+
+Run in CloudShell
+Fix 3 — Remove vpc-cni Addon
+Required for: EKS Auto Mode clusters. Auto Mode has a built-in CNI — the vpc-cni addon is incompatible and leaves a stale aws-cni binary on nodes that blocks pod sandbox creation.
+
+# Step 1 — Delete the vpc-cni addon
+aws eks delete-addon --cluster-name <cluster> --addon-name vpc-cni
+
+# Step 2 — Verify addon is removed
+aws eks list-addons --cluster-name <cluster>
+
+# Step 3 — Recycle nodes to remove stale aws-cni binary from node filesystem
+kubectl delete nodeclaim --all
+
+# Step 4 — Delete pending pods so they reschedule on clean nodes
+kubectl delete pods -A --field-selector=status.phase=Pending
+
+# Step 5 — Watch new pods come up
+kubectl get pods -A -w
+
+Run in CloudShell
+Post-Fix Verification Checklist
+Check	Command	Expected Result
+All required IAM policies attached	aws iam list-attached-role-policies --role-name AmazonEKSClusterRole	All 4 policies present
+No stale access entries	aws eks list-access-entries --cluster-name <cluster>	No entry with AmazonEKSAutoNodeRole1 (trailing 1)
+vpc-cni addon removed	aws eks list-addons --cluster-name <cluster>	vpc-cni not in list
+IPAM AssignPrivateIpAddresses succeeding	aws cloudtrail lookup-events --lookup-attributes AttributeKey=EventName,AttributeValue=AssignPrivateIpAddresses	Most recent event has no errorCode
+All pods Running	kubectl get pods -A	All pods in Running state, 0 Pending
+Nodes Ready	kubectl get nodes	All nodes in Ready state
+Prevention
+Mandatory IAM Policies for EKS Auto Mode
+When creating an EKS Auto Mode cluster, AmazonEKSClusterRole must have all 4 policies attached. Missing any one will cause pods or volumes to fail.
+
+Policy	Key Permissions Granted	Symptom if Missing
+AmazonEKSClusterPolicy	Core EKS cluster management (DescribeCluster, CreateNodegroup, etc.)	Cluster fails to create or update
+AmazonEKSComputePolicy	Auto Mode node provisioning (RunInstances, TerminateInstances, etc.)	Auto Mode cannot launch or terminate nodes
+AmazonEKSNetworkingPolicy	Pod IP assignment (AssignPrivateIpAddresses, CreateNetworkInterface, AttachNetworkInterface, etc.)	All pods stuck Pending — IPAM controller gets 403 on AssignPrivateIpAddresses
+AmazonEKSBlockStoragePolicy	EBS volume management (CreateVolume, AttachVolume, etc.)	PersistentVolumeClaims fail to bind — EBS CSI driver gets 403
+Addons Incompatible with EKS Auto Mode
+Addon	Conflict	Action
+vpc-cni	Auto Mode has a built-in CNI. Installing vpc-cni deploys the aws-node daemonset and writes the aws-cni binary to /opt/cni/bin on nodes. Auto Mode nodes then invoke aws-cni for pod networking instead of the native CNI, causing FailedCreatePodSandBox.	Delete: aws eks delete-addon --cluster-name <cluster> --addon-name vpc-cni. Then recycle nodes: kubectl delete nodeclaim --all
+aws-ebs-csi-driver	Auto Mode includes a built-in EBS CSI driver. Installing the addon creates a duplicate driver that can conflict with volume attachment.	Remove if using Auto Mode storage. Use the built-in driver instead.
+kube-proxy (self-managed)	Auto Mode manages kube-proxy natively. A self-managed kube-proxy daemonset can conflict with Auto Mode's network rules.	Use the EKS-managed kube-proxy addon or remove it — Auto Mode handles this automatically.
+IAM Credential Propagation Delay
+After attaching an IAM policy to a role, assumed-role sessions created before the attachment will not pick up the new policy until their session token expires — typically 60–90 seconds for EKS Auto Mode controller sessions.
+
+Do not re-apply the fix or recycle nodes during this window
+The IPAM controller will retry automatically and succeed once its session refreshes
+Confirm it worked by watching CloudTrail AssignPrivateIpAddresses events — the first event with no errorCode confirms the session has refreshed
+Generated from live incident on EKS cluster eks (us-east-1) — 2026-10-26
+
+
+
+why it don't work with node group
+Amazon Q
+Great question. EKS Auto Mode and managed node groups are fundamentally different compute models — the runbook above applies only to Auto Mode clusters. Here's why the same issue would manifest differently (or not at all) with node groups:
+
+Why AmazonEKSNetworkingPolicy is NOT needed with node groups
+Auto Mode vs Managed Node Groups — key architectural difference
+Aspect	EKS Auto Mode	Managed Node Groups
+Who assigns pod IPs	EKS IPAM controller running as AmazonEKSClusterRole	aws-node daemonset (vpc-cni) running on each node as AmazonEKSNodeRole
+Where ec2:AssignPrivateIpAddresses is called from	Cluster control plane role	Node IAM role (AmazonEKSNodeRole)
+Policy that grants it	AmazonEKSNetworkingPolicy on the cluster role	AmazonEKS_CNI_Policy on the node role
+CNI binary	Built into Auto Mode — no daemonset	aws-node daemonset deployed on every node
+vpc-cni addon	Incompatible — conflicts with built-in CNI	Required — this IS the CNI
+NodeClaims / Karpenter	Used by Auto Mode to manage nodes	Not used — ASG manages nodes
+With node groups, the equivalent issue would look like this
+If you saw pods stuck Pending on a node group cluster, the diagnosis path is completely different:
+
+# Step 1 — Check aws-node daemonset is healthy (this is the CNI on node groups)
+kubectl get pods -n kube-system -l k8s-app=aws-node
+
+# Step 2 — Check the NODE role (not the cluster role) for CNI permissions
+aws iam list-attached-role-policies --role-name <AmazonEKSNodeRole-name>
+# Must include: AmazonEKS_CNI_Policy  ← this is the node group equivalent
+
+# Step 3 — Check vpc-cni addon is installed (required on node groups, unlike Auto Mode)
+aws eks list-addons --cluster-name <cluster>
+# vpc-cni MUST be present on node group clusters
+
+# Step 4 — Check node group is healthy
+aws eks describe-nodegroup --cluster-name <cluster> --nodegroup-name <nodegroup>
+# Look for: status = ACTIVE, all desired nodes in READY state
+
+Run in CloudShell
+Side-by-side: same symptom, different fix
+Symptom	Auto Mode fix	Node group fix
+Pods stuck Pending, no IPs assigned	Attach AmazonEKSNetworkingPolicy to AmazonEKSClusterRole	Attach AmazonEKS_CNI_Policy to AmazonEKSNodeRole
+FailedCreatePodSandBox	Remove vpc-cni addon + recycle nodes	Reinstall / repair vpc-cni addon
+Nodes not registering	Fix access entry type to EC2_LINUX	Check node group IAM role trust policy and AmazonEKSWorkerNodePolicy
+AssignPrivateIpAddresses denied	Cluster role missing AmazonEKSNetworkingPolicy	Node role missing AmazonEKS_CNI_Policy
+The bottom line: On node groups, vpc-cni is the CNI and it runs on the node using the node's IAM role — so IP assignment permissions live on AmazonEKSNodeRole, not AmazonEKSClusterRole. The AmazonEKSNetworkingPolicy and the built-in IPAM controller are Auto Mode-only concepts that simply don't exist in the node group architecture.
