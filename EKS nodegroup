@@ -1,0 +1,311 @@
+Your cluster eks currently has no node groups — it's running in Auto Mode. The guide below is a comprehensive production-readiness checklist for EKS with Managed Node Groups, structured so a new EKS engineer can follow it end to end.
+
+EKS + Managed Node Groups — Production Readiness Guide
+1. Cluster foundation
+Kubernetes version
+Always run a supported, non-EOL version. EKS supports the 4 most recent minor versions. Check current support:
+
+aws eks describe-addon-versions --query 'addons[0].addonVersions[0].compatibilities[*].clusterVersion' \
+  --output text
+
+Run in CloudShell
+Enable automatic minor version upgrades on node groups so nodes stay in sync with the control plane
+Never let the node group Kubernetes version lag more than 1 minor version behind the control plane
+Control plane logging
+Enable all 5 log types — they are free to enable, you only pay for CloudWatch storage:
+
+aws eks update-cluster-config --name <cluster> \
+  --logging '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}'
+
+Run in CloudShell
+Private API endpoint
+For production, disable the public endpoint and use only the private endpoint:
+
+aws eks update-cluster-config --name <cluster> \
+  --resources-vpc-config endpointPublicAccess=false,endpointPrivateAccess=true
+
+Run in CloudShell
+If you must keep the public endpoint, restrict it to your corporate CIDR:
+
+  --resources-vpc-config endpointPublicAccess=true,publicAccessCidrs=["10.0.0.0/8"],endpointPrivateAccess=true
+
+Run in CloudShell
+2. IAM — the most critical layer
+Cluster role (AmazonEKSClusterRole) — required policies
+Policy	Purpose
+AmazonEKSClusterPolicy	Core cluster management
+AmazonEKSVPCResourceController	Security groups for pods (if used)
+Node role (AmazonEKSNodeRole) — required policies
+Policy	Purpose	Missing =
+AmazonEKSWorkerNodePolicy	Node registration with cluster	Nodes never join
+AmazonEKS_CNI_Policy	vpc-cni assigns pod IPs via ec2:AssignPrivateIpAddresses	All pods Pending
+AmazonEC2ContainerRegistryReadOnly	Pull images from ECR	ImagePullBackOff on all pods
+AmazonSSMManagedInstanceCore	SSM Session Manager access (no SSH needed)	Cannot shell into nodes
+# Verify node role policies
+aws iam list-attached-role-policies --role-name <AmazonEKSNodeRole>
+
+Run in CloudShell
+Use IRSA (IAM Roles for Service Accounts) for pod permissions
+Never attach broad permissions to the node role for application use. Use IRSA instead:
+
+# Enable OIDC provider on the cluster
+eksctl utils associate-iam-oidc-provider --cluster <cluster> --approve
+
+# Create a service account with a scoped IAM role
+eksctl create iamserviceaccount \
+  --cluster <cluster> \
+  --namespace <namespace> \
+  --name <service-account-name> \
+  --attach-policy-arn arn:aws:iam::aws:policy/<PolicyName> \
+  --approve
+
+Run in CloudShell
+3. Networking
+VPC design
+Minimum 3 subnets — one per AZ (us-east-1a, us-east-1b, us-east-1c)
+Private subnets for nodes — nodes should never have public IPs
+Public subnets for load balancers only — tag them correctly:
+# Tag private subnets (for internal load balancers and nodes)
+aws ec2 create-tags --resources <subnet-id> \
+  --tags Key=kubernetes.io/role/internal-elb,Value=1 \
+         Key=kubernetes.io/cluster/<cluster>,Value=shared
+
+# Tag public subnets (for internet-facing load balancers)
+aws ec2 create-tags --resources <subnet-id> \
+  --tags Key=kubernetes.io/role/elb,Value=1 \
+         Key=kubernetes.io/cluster/<cluster>,Value=shared
+
+Run in CloudShell
+IP address planning — critical for node groups
+vpc-cni
+
+pre-warms IPs on each node. A m5.xlarge can hold up to 58 IPs (15 per ENI × 4 ENIs). Plan your VPC CIDR to avoid exhaustion:
+
+# Check current IP usage per node
+kubectl describe node <node-name> | grep -A5 "Allocatable"
+
+# Enable prefix delegation to increase pod density (recommended for large clusters)
+kubectl set env daemonset aws-node -n kube-system ENABLE_PREFIX_DELEGATION=true
+kubectl set env daemonset aws-node -n kube-system WARM_PREFIX_TARGET=1
+
+Run in CloudShell
+Security groups for pods
+For fine-grained pod-level network isolation (e.g. RDS access only from specific pods):
+
+# Enable on the cluster
+aws eks update-cluster-config --name <cluster> \
+  --resources-vpc-config securityGroupIds=[]
+
+kubectl set env daemonset aws-node -n kube-system ENABLE_POD_ENI=true
+
+Run in CloudShell
+4. Node group configuration
+Instance type selection
+Use multiple instance types in one node group to reduce InsufficientCapacityError:
+aws eks create-nodegroup --cluster-name <cluster> \
+  --nodegroup-name prod-ng \
+  --instance-types m5.xlarge m5a.xlarge m4.xlarge \
+  --ami-type AL2_x86_64 \
+  --capacity-type ON_DEMAND \
+  --scaling-config minSize=3,maxSize=20,desiredSize=6 \
+  --subnets <private-subnet-1> <private-subnet-2> <private-subnet-3>
+
+Run in CloudShell
+Spread across AZs
+Always deploy node groups across at least 3 AZs. Use topology spread constraints on critical workloads:
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app: my-app
+
+Managed node group update strategy
+Set maxUnavailable to control rolling updates:
+
+aws eks update-nodegroup-config --cluster-name <cluster> \
+  --nodegroup-name prod-ng \
+  --update-config maxUnavailablePercentage=33
+
+Run in CloudShell
+Use Bottlerocket AMI for security-hardened nodes
+--ami-type BOTTLEROCKET_x86_64
+
+Run in CloudShell
+Bottlerocket is immutable, has a minimal attack surface, and supports automatic security updates.
+
+5. Required addons — install and pin versions
+Addon	Purpose	Install command
+vpc-cni	Pod networking (IP assignment)	Pre-installed — keep updated
+coredns	In-cluster DNS	Pre-installed — keep updated
+kube-proxy	Service networking	Pre-installed — keep updated
+aws-ebs-csi-driver	PersistentVolumes on EBS	aws eks create-addon --addon-name aws-ebs-csi-driver
+aws-load-balancer-controller	ALB/NLB for Ingress/Service	Install via Helm
+metrics-server	HPA / kubectl top	kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+# Check all addon versions and available updates
+aws eks describe-addon-versions --kubernetes-version <version> \
+  --query 'addons[*].{Name:addonName,Latest:addonVersions[0].addonVersion}'
+
+# Update an addon to latest
+aws eks update-addon --cluster-name <cluster> \
+  --addon-name vpc-cni \
+  --resolve-conflicts OVERWRITE
+
+Run in CloudShell
+6. Cluster autoscaler
+Install Cluster Autoscaler to automatically scale node groups based on pending pods:
+
+# Add required tags to node group ASG
+aws autoscaling create-or-update-tags \
+  --tags ResourceId=<asg-name>,ResourceType=auto-scaling-group,Key=k8s.io/cluster-autoscaler/enabled,Value=true,PropagateAtLaunch=true \
+         ResourceId=<asg-name>,ResourceType=auto-scaling-group,Key=k8s.io/cluster-autoscaler/<cluster>,Value=owned,PropagateAtLaunch=true
+
+# Install via Helm
+helm repo add autoscaler https://kubernetes.github.io/autoscaler
+helm install cluster-autoscaler autoscaler/cluster-autoscaler \
+  --namespace kube-system \
+  --set autoDiscovery.clusterName=<cluster> \
+  --set awsRegion=us-east-1 \
+  --set rbac.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<IRSA-role-arn>
+
+Run in CloudShell
+7. Observability
+CloudWatch Container Insights
+# Install CloudWatch agent + Fluent Bit for logs and metrics
+ClusterName=<cluster>
+RegionName=us-east-1
+FluentBitHttpPort='2020'
+FluentBitReadFromHead='Off'
+
+curl https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/quickstart/cwagent-fluent-bit-quickstart.yaml \
+  | sed "s/{{cluster_name}}/${ClusterName}/;s/{{region_name}}/${RegionName}/;s/{{http_server_toggle}}/On/;s/{{http_server_port}}/${FluentBitHttpPort}/;s/{{read_from_head}}/${FluentBitReadFromHead}/;s/{{read_from_tail}}/On/" \
+  | kubectl apply -f -
+
+Run in CloudShell
+Key CloudWatch alarms to create
+# Node CPU > 80% for 5 minutes
+aws cloudwatch put-metric-alarm \
+  --alarm-name eks-node-cpu-high \
+  --metric-name node_cpu_utilization \
+  --namespace ContainerInsights \
+  --dimensions Name=ClusterName,Value=<cluster> \
+  --statistic Average --period 300 --threshold 80 \
+  --comparison-operator GreaterThanThreshold --evaluation-periods 2
+
+# Pending pods > 0 for 5 minutes (scheduling failure)
+aws cloudwatch put-metric-alarm \
+  --alarm-name eks-pending-pods \
+  --metric-name cluster_failed_node_count \
+  --namespace ContainerInsights \
+  --dimensions Name=ClusterName,Value=<cluster> \
+  --statistic Average --period 300 --threshold 0 \
+  --comparison-operator GreaterThanThreshold --evaluation-periods 1
+
+Run in CloudShell
+8. Security hardening
+Pod Security Standards (replaces PodSecurityPolicy)
+# Enforce restricted policy on production namespaces
+kubectl label namespace production \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/warn=restricted
+
+Run in CloudShell
+Network policies — default deny all, then allow explicitly
+# Default deny all ingress and egress in a namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+
+Enable Secrets encryption at rest
+aws eks associate-encryption-config --cluster-name <cluster> \
+  --encryption-config '[{"resources":["secrets"],"provider":{"keyArn":"<kms-key-arn>"}}]'
+
+Run in CloudShell
+Enable GuardDuty EKS Protection
+aws guardduty update-detector --detector-id <detector-id> \
+  --features '[{"Name":"EKS_AUDIT_LOGS","Status":"ENABLED"},{"Name":"EKS_RUNTIME_MONITORING","Status":"ENABLED"}]'
+
+Run in CloudShell
+9. High availability for workloads
+Pod Disruption Budgets — prevent outages during node upgrades
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-app-pdb
+spec:
+  minAvailable: 2        # always keep at least 2 pods running
+  selector:
+    matchLabels:
+      app: my-app
+
+Resource requests and limits — always set both
+resources:
+  requests:
+    cpu: "250m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+Without requests, the scheduler cannot make placement decisions. Without limits, a runaway pod can starve the node.
+
+Liveness and readiness probes — always configure
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 5
+
+10. Production readiness checklist — final verification
+# 1. Cluster version is current and supported
+aws eks describe-cluster --name <cluster> --query 'cluster.version'
+
+# 2. All control plane logs enabled
+aws eks describe-cluster --name <cluster> \
+  --query 'cluster.logging.clusterLogging'
+
+# 3. Private endpoint enabled
+aws eks describe-cluster --name <cluster> \
+  --query 'cluster.resourcesVpcConfig.{Public:endpointPublicAccess,Private:endpointPrivateAccess}'
+
+# 4. Node role has all required policies
+aws iam list-attached-role-policies --role-name <AmazonEKSNodeRole>
+
+# 5. All addons up to date
+aws eks list-addons --cluster-name <cluster>
+
+# 6. No pods without resource requests
+kubectl get pods -A -o json | jq '.items[] | select(.spec.containers[].resources.requests == null) | .metadata.name'
+
+# 7. No pods without probes
+kubectl get pods -A -o json | jq '.items[] | select(.spec.containers[].livenessProbe == null) | .metadata.name'
+
+# 8. All nodes Ready across 3+ AZs
+kubectl get nodes -L topology.kubernetes.io/zone
+
+# 9. PodDisruptionBudgets exist for critical workloads
+kubectl get pdb -A
+
+# 10. Secrets encryption enabled
+aws eks describe-cluster --name <cluster> --query 'cluster.encryptionConfig'
+
+Run in CloudShell
+The single most common production gap seen on node group clusters is missing AmazonEKS_CNI_Policy on the node role — the exact node-group equivalent of the AmazonEKSNetworkingPolicy issue you resolved today on Auto Mode. Always verify IAM policies first when pods are stuck Pending.
